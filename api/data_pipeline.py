@@ -443,6 +443,10 @@ def transform_documents_and_save_to_db(
     db.load(documents)
     db.transform(key="split_and_embed")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    
+    # Clear the transformer before saving to avoid pickle issues with non-serializable clients
+    # (e.g., Google genai.Client contains thread locks that cannot be pickled)
+    db.transformer_setups = {}
     db.save_state(filepath=db_path)
     return db
 

@@ -3,7 +3,7 @@
 > **Feature**: AI-powered interactive code maps for codebase understanding
 > **Branch**: `feature/codemaps`
 > **Created**: 2025-12-17
-> **Status**: Planning
+> **Status**: Implementation Complete
 
 ---
 
@@ -94,6 +94,7 @@ US-5: As an AI agent user, I want to reference a codemap in my prompts
    - Expandable/collapsible node groups
    - Click-to-navigate to source code
    - Multiple layout options (hierarchical, force-directed, etc.)
+   - JSON graph as source of truth; Mermaid as export/fallback
 
 4. **Trace Guide**
    - Markdown narrative explaining the flow
@@ -123,8 +124,8 @@ US-5: As an AI agent user, I want to reference a codemap in my prompts
 ├─────────────────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │
 │  │ CodemapPanel │  │ GraphViewer  │  │ TraceGuide   │  │ NodeDetails │ │
-│  │  - Query UI  │  │  - Mermaid   │  │  - Markdown  │  │  - Code     │ │
-│  │  - History   │  │  - D3.js     │  │  - Sections  │  │  - Links    │ │
+│  │  - Query UI  │  │  - JSON Graph│  │  - Markdown  │  │  - Code     │ │
+│  │  - History   │  │  - Graph Lib │  │  - Sections  │  │  - Links    │ │
 │  │  - Favorites │  │  - Zoom/Pan  │  │  - Expand    │  │  - Context  │ │
 │  └──────────────┘  └──────────────┘  └──────────────┘  └─────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -178,7 +179,7 @@ US-5: As an AI agent user, I want to reference a codemap in my prompts
 │  │                                                                      │ │
 │  │  ~/.adalflow/                                                       │ │
 │  │  ├── repos/          - Cloned source code                          │ │
-│  │  ├── databases/      - FAISS vector indices                        │ │
+│  │  ├── databases/      - LocalDB .pkl files (docs + embeddings)       │ │
 │  │  ├── codemaps/       - Saved codemap artifacts (NEW)               │ │
 │  │  │   ├── {id}.json   - Codemap data                                │ │
 │  │  │   └── {id}.md     - Trace guide markdown                        │ │
@@ -268,7 +269,7 @@ US-5: As an AI agent user, I want to reference a codemap in my prompts
 
 from enum import Enum
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
 
 # ============================================================================
@@ -333,11 +334,16 @@ class SourceLocation(BaseModel):
     column_start: Optional[int] = Field(None, ge=0)
     column_end: Optional[int] = Field(None, ge=0)
 
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.line_end < self.line_start:
+            raise ValueError("line_end must be >= line_start")
+        return self
+
 class CodeSnippet(BaseModel):
     """Code snippet for preview"""
     code: str = Field(..., description="Actual code content")
     language: str = Field(..., description="Programming language")
-    highlighted: Optional[str] = Field(None, description="HTML-highlighted code")
 
 class CodemapNode(BaseModel):
     """A node in the codemap graph"""
@@ -346,7 +352,7 @@ class CodemapNode(BaseModel):
     type: NodeType = Field(..., description="Node type")
 
     # Location
-    location: SourceLocation = Field(..., description="Source code location")
+    location: Optional[SourceLocation] = Field(None, description="Source code location (required for navigable nodes)")
 
     # Metadata
     description: Optional[str] = Field(None, description="Brief description")
@@ -470,14 +476,17 @@ class CodemapGenerateRequest(BaseModel):
     query: str
 
     # Options
-    analysis_type: Optional[str] = Field("auto", description="Type: auto, data_flow, control_flow, dependencies, architecture")
+    language: Optional[str] = Field("en", description="Language for generated text (e.g., trace guide)")
+    analysis_type: Optional[str] = Field("auto", description="Type: auto, data_flow, control_flow, dependencies, call_graph, architecture")
     depth: Optional[int] = Field(3, ge=1, le=10, description="Analysis depth")
     max_nodes: Optional[int] = Field(50, ge=10, le=200, description="Maximum nodes")
 
     # Filters
-    include_paths: Optional[List[str]] = Field(None, description="Paths to include")
-    exclude_paths: Optional[List[str]] = Field(None, description="Paths to exclude")
-    file_types: Optional[List[str]] = Field(None, description="File extensions to include")
+    excluded_dirs: Optional[List[str]] = Field(None, description="Directories to exclude (same semantics as wiki)")
+    excluded_files: Optional[List[str]] = Field(None, description="File patterns to exclude (glob-style, same semantics as wiki)")
+    included_dirs: Optional[List[str]] = Field(None, description="Directories to include exclusively")
+    included_files: Optional[List[str]] = Field(None, description="File patterns to include exclusively")
+    file_types: Optional[List[str]] = Field(None, description="File extensions to prioritize/analyze (post-retrieval filter)")
 
     # Model selection
     provider: Optional[str] = Field("google", description="LLM provider")
@@ -549,14 +558,13 @@ export interface SourceLocation {
 export interface CodeSnippet {
   code: string;
   language: string;
-  highlighted?: string;
 }
 
 export interface CodemapNode {
   id: string;
   label: string;
   type: NodeType;
-  location: SourceLocation;
+  location?: SourceLocation;
   description?: string;
   importance: Importance;
   snippet?: CodeSnippet;
@@ -637,11 +645,14 @@ export interface Codemap {
 export interface CodemapGenerateRequest {
   repo_url: string;
   query: string;
+  language?: string;
   analysis_type?: string;
   depth?: number;
   max_nodes?: number;
-  include_paths?: string[];
-  exclude_paths?: string[];
+  excluded_dirs?: string[];
+  excluded_files?: string[];
+  included_dirs?: string[];
+  included_files?: string[];
   file_types?: string[];
   provider?: string;
   model?: string;
@@ -742,7 +753,7 @@ api/
 
 import asyncio
 import logging
-from typing import Optional, Callable, AsyncGenerator
+from typing import Optional, Callable
 from datetime import datetime
 import uuid
 
@@ -756,7 +767,6 @@ from .renderer import MermaidRenderer, JSONRenderer
 from .llm import QueryParser, RelationshipExtractor, TraceWriter
 from .storage import CodemapStorage
 
-from api.data_pipeline import DatabaseManager
 from api.rag import RAG
 
 logger = logging.getLogger(__name__)
@@ -779,11 +789,9 @@ class CodemapEngine:
 
     def __init__(
         self,
-        db_manager: DatabaseManager,
         provider: str = "google",
         model: Optional[str] = None
     ):
-        self.db_manager = db_manager
         self.provider = provider
         self.model = model
 
@@ -842,11 +850,19 @@ class CodemapEngine:
             ))
 
             repo_info = self._parse_repo_url(request.repo_url)
-            local_db = await self.db_manager.get_or_create_database(
-                repo_url=request.repo_url,
-                token=request.token,
-                repo_type=request.type
+            rag = RAG(provider=self.provider, model=self.model)
+            rag.prepare_retriever(
+                repo_url_or_path=request.repo_url,
+                type=request.type or "github",
+                access_token=request.token,
+                excluded_dirs=request.excluded_dirs,
+                excluded_files=request.excluded_files,
+                included_dirs=request.included_dirs,
+                included_files=request.included_files
             )
+
+            repo_path = rag.db_manager.repo_paths["save_repo_dir"]
+            commit_hash = self._get_repo_head_hash(repo_path)
 
             # Step 3: Retrieve relevant documents via RAG
             await self._emit_progress(progress_callback, CodemapProgress(
@@ -856,11 +872,17 @@ class CodemapEngine:
                 current_step="Finding relevant code...",
             ))
 
-            rag = RAG(local_db)
-            relevant_docs = await rag.retrieve(
-                query=request.query,
+            retrieval = rag.retriever(
+                request.query,
                 top_k=request.max_nodes * 2  # Retrieve more, prune later
             )
+            relevant_docs = retrieval[0].documents if isinstance(retrieval, list) else retrieval.documents
+
+            if request.file_types:
+                relevant_docs = [
+                    doc for doc in relevant_docs
+                    if any(doc.meta_data.get("file_path", "").endswith(ext) for ext in request.file_types)
+                ]
 
             # Step 4: Static code analysis
             await self._emit_progress(progress_callback, CodemapProgress(
@@ -873,9 +895,11 @@ class CodemapEngine:
             analyzer = get_analyzer(repo_info.language)
             analysis_result = await analyzer.analyze(
                 documents=relevant_docs,
-                repo_path=local_db.repo_path,
-                include_paths=request.include_paths,
-                exclude_paths=request.exclude_paths,
+                repo_path=repo_path,
+                excluded_dirs=request.excluded_dirs,
+                excluded_files=request.excluded_files,
+                included_dirs=request.included_dirs,
+                included_files=request.included_files,
                 depth=request.depth
             )
 
@@ -956,6 +980,7 @@ class CodemapEngine:
 
             trace_guide = await self.trace_writer.write(
                 query=request.query,
+                language=request.language or "en",
                 graph=graph,
                 analysis=analysis_result,
                 query_intent=query_intent
@@ -970,7 +995,7 @@ class CodemapEngine:
                 repo_url=request.repo_url,
                 repo_owner=repo_info.owner,
                 repo_name=repo_info.name,
-                commit_hash=local_db.commit_hash,
+                commit_hash=commit_hash,
                 query=request.query,
                 analysis_type=analysis_type,
                 title=self._generate_title(request.query, query_intent),
@@ -1026,6 +1051,11 @@ class CodemapEngine:
     def _parse_repo_url(self, url: str):
         """Parse repository URL to extract owner, name, etc."""
         # Implementation to extract repo info from URL
+        pass
+
+    def _get_repo_head_hash(self, repo_path: str) -> Optional[str]:
+        """Best-effort git HEAD hash lookup for the cloned repository"""
+        # Implementation should return current HEAD commit hash, or None if unavailable
         pass
 
     def _generate_title(self, query: str, query_intent) -> str:
@@ -1110,8 +1140,10 @@ class PythonAnalyzer:
         self,
         documents: List,
         repo_path: str,
-        include_paths: Optional[List[str]] = None,
-        exclude_paths: Optional[List[str]] = None,
+        excluded_dirs: Optional[List[str]] = None,
+        excluded_files: Optional[List[str]] = None,
+        included_dirs: Optional[List[str]] = None,
+        included_files: Optional[List[str]] = None,
         depth: int = 3
     ) -> Dict[str, AnalysisResult]:
         """
@@ -1120,8 +1152,10 @@ class PythonAnalyzer:
         Args:
             documents: List of Document objects from RAG
             repo_path: Path to cloned repository
-            include_paths: Paths to include
-            exclude_paths: Paths to exclude
+            excluded_dirs: Directories to exclude
+            excluded_files: File patterns to exclude
+            included_dirs: Directories to include exclusively
+            included_files: File patterns to include exclusively
             depth: Analysis depth
 
         Returns:
@@ -1134,7 +1168,7 @@ class PythonAnalyzer:
             if not file_path.endswith(".py"):
                 continue
 
-            if self._should_skip(file_path, include_paths, exclude_paths):
+            if self._should_skip(file_path, excluded_dirs, excluded_files, included_dirs, included_files):
                 continue
 
             full_path = os.path.join(repo_path, file_path)
@@ -1157,6 +1191,12 @@ class PythonAnalyzer:
 
         with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
             source = f.read()
+
+        return self.analyze_code(source, relative_path)
+
+    def analyze_code(self, source: str, relative_path: str) -> AnalysisResult:
+        """Analyze Python code from an in-memory string (useful for unit tests)"""
+        self.current_file = relative_path
 
         try:
             tree = ast.parse(source)
@@ -1340,20 +1380,32 @@ class PythonAnalyzer:
     def _should_skip(
         self,
         path: str,
-        include_paths: Optional[List[str]],
-        exclude_paths: Optional[List[str]]
+        excluded_dirs: Optional[List[str]],
+        excluded_files: Optional[List[str]],
+        included_dirs: Optional[List[str]],
+        included_files: Optional[List[str]]
     ) -> bool:
         """Check if path should be skipped"""
-        if exclude_paths:
-            for pattern in exclude_paths:
+        if included_dirs or included_files:
+            if included_dirs:
+                for pattern in included_dirs:
+                    if pattern in path:
+                        return False
+            if included_files:
+                for pattern in included_files:
+                    if pattern in path:
+                        return False
+            return True
+
+        if excluded_dirs:
+            for pattern in excluded_dirs:
                 if pattern in path:
                     return True
 
-        if include_paths:
-            for pattern in include_paths:
+        if excluded_files:
+            for pattern in excluded_files:
                 if pattern in path:
-                    return False
-            return True
+                    return True
 
         return False
 
@@ -1453,6 +1505,7 @@ Guidelines:
 TRACE_GUIDE_USER = """Write a trace guide for this codemap:
 
 Original Query: {query}
+Language: {language}
 
 Graph Summary:
 - Nodes: {node_count}
@@ -1500,7 +1553,6 @@ from pydantic import ValidationError
 
 from api.codemap.models import CodemapGenerateRequest, CodemapProgress, CodemapStatus
 from api.codemap.engine import CodemapEngine
-from api.data_pipeline import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
@@ -1517,17 +1569,13 @@ class CodemapWebSocketHandler:
     5. Connection closes
     """
 
-    def __init__(self):
-        self.db_manager = DatabaseManager()
-
     async def handle(self, websocket: WebSocket):
         """Handle a WebSocket connection for codemap generation"""
         await websocket.accept()
 
         try:
             # Receive generation request
-            data = await websocket.receive_text()
-            request_dict = json.loads(data)
+            request_dict = await websocket.receive_json()
 
             try:
                 request = CodemapGenerateRequest(**request_dict)
@@ -1541,7 +1589,6 @@ class CodemapWebSocketHandler:
 
             # Create engine
             engine = CodemapEngine(
-                db_manager=self.db_manager,
                 provider=request.provider or "google",
                 model=request.model
             )
@@ -1620,8 +1667,8 @@ src/
 │       ├── CodemapPanel.tsx            # Main panel/sidebar
 │       ├── CodemapQueryInput.tsx       # Query input with suggestions
 │       ├── CodemapViewer.tsx           # Main viewer container
-│       ├── CodemapGraph.tsx            # Graph visualization
-│       ├── CodemapMermaid.tsx          # Mermaid-based rendering
+│       ├── CodemapGraph.tsx            # Interactive graph (primary)
+│       ├── CodemapMermaid.tsx          # Mermaid export/fallback view
 │       ├── TraceGuide.tsx              # Trace guide panel
 │       ├── TraceSection.tsx            # Individual trace section
 │       ├── NodeInspector.tsx           # Node details panel
@@ -2443,6 +2490,9 @@ components:
           type: string
         query:
           type: string
+        language:
+          type: string
+          default: en
         analysis_type:
           type: string
           enum: [auto, data_flow, control_flow, dependencies, call_graph, architecture]
@@ -2457,11 +2507,23 @@ components:
           minimum: 10
           maximum: 200
           default: 50
-        include_paths:
+        excluded_dirs:
           type: array
           items:
             type: string
-        exclude_paths:
+        excluded_files:
+          type: array
+          items:
+            type: string
+        included_dirs:
+          type: array
+          items:
+            type: string
+        included_files:
+          type: array
+          items:
+            type: string
+        file_types:
           type: array
           items:
             type: string
@@ -2522,9 +2584,12 @@ components:
 {
   "repo_url": "https://github.com/owner/repo",
   "query": "How does authentication work?",
+  "language": "en",
   "analysis_type": "auto",
   "depth": 3,
   "max_nodes": 50,
+  "excluded_dirs": ["./node_modules/", "./.git/"],
+  "excluded_files": ["*.lock", ".env", ".env.*"],
   "provider": "google",
   "model": "gemini-2.5-flash",
   "token": "optional_access_token",
@@ -2563,6 +2628,14 @@ components:
   "message": "Error description"
 }
 ```
+
+### 7.3 Security & Access Control
+
+- **Token handling**: Treat `token` as input-only (use for cloning/indexing); never persist it in `Codemap`, never include in logs, and never echo it back to clients.
+- **Sharing**: `share_token` must grant access only to the stored codemap artifact (not the repo). Use high-entropy random tokens, store with expiry, and invalidate on delete.
+- **Authorization**: Reuse existing app-level auth gating (e.g., `DEEPWIKI_AUTH_MODE`) for non-shared endpoints; shared endpoints validate only `share_token`.
+- **Resource limits**: Add server-side limits (max concurrent generations per client, max `max_nodes`, timeouts) and cancel background work on WebSocket disconnect.
+- **Rendering safety**: Render syntax highlighting client-side; sanitize/disable raw HTML in markdown; configure Mermaid with strict security settings.
 
 ---
 
@@ -2605,12 +2678,14 @@ Infer:
    - Function X calls Function Y → "calls" edge
 
 2. Indirect relationships (from LLM reasoning)
-   - "This validator is used before database write" → "guards" edge
-   - "Error from here propagates to handler" → "error_flow" edge
+   - "This validator is used before database write" → type="control_flow", label="guards"
+   - "Error from here propagates to handler" → type="control_flow", label="error_flow"
 
 3. Architectural relationships
-   - "Service layer depends on repository layer" → "depends_on" edge
-   - "Controller routes to service" → "routes_to" edge
+   - "Service layer depends on repository layer" → type="depends_on"
+   - "Controller routes to service" → type="calls" (if supported by static analysis) else type="depends_on", label="routes_to"
+
+Constraint: LLM-suggested relationships must map to existing `EdgeType` values and should be emitted only when the referenced nodes exist and there is supporting evidence in retrieved code or static analysis.
 ```
 
 ### 8.3 Trace Guide Generation Strategy
@@ -2659,7 +2734,7 @@ Structure:
 ```
 ~/.adalflow/
 ├── repos/           # Shared with existing wiki
-├── databases/       # Shared FAISS indices
+├── databases/       # Shared LocalDB .pkl files (docs + embeddings)
 ├── wikicache/       # Existing wiki cache
 └── codemaps/        # NEW: Codemap storage
     ├── {id}.json    # Codemap data
@@ -2670,14 +2745,10 @@ Structure:
 ### 9.3 Frontend Route Integration
 
 ```typescript
-// src/app/[owner]/[repo]/layout.tsx
+// src/app/[owner]/[repo]/page.tsx
 
-// Add codemap tab to repository layout
-const tabs = [
-  { name: 'Wiki', href: `/${owner}/${repo}` },
-  { name: 'Codemap', href: `/${owner}/${repo}/codemap` },  // NEW
-  { name: 'Ask', href: `/${owner}/${repo}/ask` },
-];
+// Add a "Codemap" link/button in the repo header that navigates to:
+// `/${owner}/${repo}/codemap` (preserve query params like token/provider/model/language).
 ```
 
 ---
@@ -2687,10 +2758,11 @@ const tabs = [
 ### 10.1 Unit Tests
 
 ```python
-# tests/codemap/test_analyzer.py
+# tests/unit/test_codemap_analyzer.py
 
 import pytest
 from api.codemap.analyzer.python_analyzer import PythonAnalyzer
+from api.codemap.models import NodeType
 
 class TestPythonAnalyzer:
     def test_extract_classes(self):
@@ -2703,8 +2775,8 @@ class MyClass:
         result = analyzer.analyze_code(code, "test.py")
 
         assert len(result.symbols) == 2
-        assert result.symbols[0].name == "MyClass"
-        assert result.symbols[0].type == "class"
+        assert any(s.name == "MyClass" and s.type == NodeType.CLASS for s in result.symbols)
+        assert any(s.name == "method" and s.type == NodeType.METHOD for s in result.symbols)
 
     def test_extract_imports(self):
         code = '''
@@ -2715,8 +2787,7 @@ import os
         result = analyzer.analyze_code(code, "test.py")
 
         assert len(result.imports) == 2
-        assert result.imports[0].module == "module"
-        assert result.imports[0].names == ["func"]
+        assert any(imp.module == "module" and imp.names == ["func"] for imp in result.imports)
 
     def test_extract_calls(self):
         code = '''
@@ -2735,15 +2806,15 @@ def caller():
 ### 10.2 Integration Tests
 
 ```python
-# tests/codemap/test_engine.py
+# tests/integration/test_codemap_engine.py
 
 import pytest
 from api.codemap.engine import CodemapEngine
-from api.codemap.models import CodemapGenerateRequest
+from api.codemap.models import CodemapGenerateRequest, CodemapStatus
 
 @pytest.mark.asyncio
 async def test_generate_codemap():
-    engine = CodemapEngine(db_manager=mock_db_manager)
+    engine = CodemapEngine(provider="google")
 
     request = CodemapGenerateRequest(
         repo_url="https://github.com/test/repo",
@@ -2759,50 +2830,13 @@ async def test_generate_codemap():
     assert codemap is not None
     assert len(codemap.graph.nodes) > 0
     assert len(progress_updates) > 0
-    assert codemap.status == "completed"
+    assert codemap.status == CodemapStatus.COMPLETED
 ```
 
-### 10.3 E2E Tests
+### 10.3 Frontend QA (v1)
 
-```typescript
-// tests/e2e/codemap.spec.ts
-
-import { test, expect } from '@playwright/test';
-
-test.describe('Codemap Feature', () => {
-  test('should generate codemap from query', async ({ page }) => {
-    await page.goto('/owner/repo/codemap');
-
-    // Enter query
-    await page.fill('[data-testid="codemap-query-input"]', 'How does authentication work?');
-    await page.click('[data-testid="codemap-generate-btn"]');
-
-    // Wait for generation
-    await expect(page.locator('[data-testid="codemap-progress"]')).toBeVisible();
-    await expect(page.locator('[data-testid="codemap-viewer"]')).toBeVisible({ timeout: 60000 });
-
-    // Verify diagram rendered
-    await expect(page.locator('svg.mermaid')).toBeVisible();
-
-    // Verify trace guide
-    await expect(page.locator('[data-testid="trace-guide"]')).toContainText('authentication');
-  });
-
-  test('should navigate to code on node click', async ({ page }) => {
-    // Setup: have a codemap displayed
-    await page.goto('/owner/repo/codemap/existing-id');
-
-    // Click on a node
-    await page.click('.node:first-child');
-
-    // Verify node inspector opens
-    await expect(page.locator('[data-testid="node-inspector"]')).toBeVisible();
-
-    // Verify file location shown
-    await expect(page.locator('[data-testid="node-location"]')).toContainText('.py');
-  });
-});
-```
+- Manual smoke tests: generate a codemap, verify progress updates, confirm diagram renders, verify node inspection and click-to-navigate.
+- Optional automation (future): add Playwright (or equivalent) to `package.json` and introduce `tests/e2e/` once the repo has a frontend test runner baseline.
 
 ---
 
@@ -2814,58 +2848,60 @@ test.describe('Codemap Feature', () => {
 - [ ] Create `api/codemap/` directory structure
 - [ ] Implement Pydantic models (`models.py`)
 - [ ] Implement Python AST analyzer (`analyzer/python_analyzer.py`)
-- [ ] Create basic node/edge builders
-- [ ] Set up storage layer
-- [ ] Add REST endpoints (generate, get, list)
-- [ ] Basic unit tests
+- [x] Create basic node/edge builders
+- [x] Set up storage layer
+- [x] Add REST endpoints (generate, get, list)
+- [x] Basic unit tests
 
 **Deliverable**: Can analyze Python files and generate raw graph data
 
 ### Phase 2: LLM Integration (Week 3-4)
 **Goal**: AI-powered analysis and generation
 
-- [ ] Implement query parser with LLM
-- [ ] Implement relationship extractor
-- [ ] Implement trace guide writer
-- [ ] Add Mermaid renderer
-- [ ] Integrate with existing RAG pipeline
-- [ ] WebSocket handler for streaming
+- [x] Implement query parser with LLM
+- [x] Implement relationship extractor
+- [x] Implement trace guide writer
+- [x] Add Mermaid renderer
+- [x] Integrate with existing RAG pipeline
+- [x] WebSocket handler for streaming
 
 **Deliverable**: Can generate complete codemaps with AI explanations
 
 ### Phase 3: Frontend Core (Week 5-6)
 **Goal**: Basic UI for codemap viewing
 
-- [ ] Create TypeScript types
-- [ ] Implement `CodemapPanel` component
-- [ ] Implement `CodemapMermaid` component
-- [ ] Implement `TraceGuide` component
-- [ ] Add WebSocket hook for generation
-- [ ] Create codemap page route
+- [x] Create TypeScript types
+- [x] Implement `CodemapPanel` component
+- [x] Implement `CodemapMermaid` component
+- [x] Implement `TraceGuide` component
+- [x] Add WebSocket hook for generation
+- [x] Create codemap page route
 
 **Deliverable**: Can view codemaps in browser with basic interactions
 
 ### Phase 4: Interactivity (Week 7-8)
 **Goal**: Rich interactive experience
 
-- [ ] Node selection and highlighting
-- [ ] Node inspector panel
-- [ ] Click-to-navigate to source
-- [ ] Zoom/pan controls
-- [ ] View mode switching (graph/trace/split)
-- [ ] History and favorites
+- [x] Node selection and highlighting
+- [x] Node inspector panel
+- [x] Click-to-navigate to source
+- [x] Zoom/pan controls
+- [x] View mode switching (graph/trace/split)
+- [x] History and favorites
 
 **Deliverable**: Full interactive codemap experience
 
 ### Phase 5: Polish & Integration (Week 9-10)
 **Goal**: Production-ready feature
 
-- [ ] JavaScript/TypeScript analyzer
-- [ ] Share functionality
-- [ ] Integration with existing wiki
-- [ ] Performance optimization
-- [ ] Comprehensive testing
-- [ ] Documentation
+- [x] JavaScript/TypeScript analyzer
+- [x] Share functionality
+- [x] Integration with existing wiki
+- [x] Security hardening (token redaction, share expiry, rate limiting)
+- [x] Performance optimization (analysis cache, query intent cache)
+- [x] Comprehensive testing (55 unit/integration tests)
+- [x] Documentation (User Guide, API Reference, Smoke Test Checklist)
+- [x] i18n support (10 languages)
 
 **Deliverable**: Feature ready for release
 

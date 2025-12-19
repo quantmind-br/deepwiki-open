@@ -13,7 +13,7 @@ import { extractUrlDomain, extractUrlPath } from '@/utils/urlDecoder';
 import Link from 'next/link';
 import { useParams, useSearchParams } from 'next/navigation';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FaBitbucket, FaBookOpen, FaComments, FaDownload, FaExclamationTriangle, FaFileExport, FaFolder, FaGithub, FaGitlab, FaHome, FaSync, FaTimes } from 'react-icons/fa';
+import { FaBitbucket, FaBookOpen, FaComments, FaDownload, FaExclamationTriangle, FaFileExport, FaFolder, FaGithub, FaGitlab, FaHome, FaProjectDiagram, FaSync, FaTimes } from 'react-icons/fa';
 // Define the WikiSection and WikiStructure types directly in this file
 // since the imported types don't have the sections and rootSections properties
 interface WikiSection {
@@ -1948,6 +1948,13 @@ IMPORTANT:
             <Link href="/" className="text-[var(--accent-primary)] hover:text-[var(--highlight)] flex items-center gap-1.5 transition-colors border-b border-[var(--border-color)] hover:border-[var(--accent-primary)] pb-0.5">
               <FaHome /> {messages.repoPage?.home || 'Home'}
             </Link>
+            <span className="text-[var(--border-color)]">|</span>
+            <Link
+              href={`/${owner}/${repo}/codemap?type=${effectiveRepoInfo.type}${currentToken ? `&token=${currentToken}` : ''}${providerParam ? `&provider=${providerParam}` : ''}${modelParam ? `&model=${modelParam}` : ''}${language ? `&language=${language}` : ''}`}
+              className="text-[var(--accent-primary)] hover:text-[var(--highlight)] flex items-center gap-1.5 transition-colors border-b border-[var(--border-color)] hover:border-[var(--accent-primary)] pb-0.5"
+            >
+              <FaProjectDiagram /> {messages.repoPage?.codemap || 'Codemap'}
+            </Link>
           </div>
         </div>
       </header>
@@ -2087,7 +2094,7 @@ IMPORTANT:
               </div>
 
               {/* Refresh Wiki button */}
-              <div className="mb-5">
+              <div className="mb-3">
                 <button
                   onClick={() => setIsModelSelectionModalOpen(true)}
                   disabled={isLoading}
@@ -2096,6 +2103,17 @@ IMPORTANT:
                   <FaSync className={`mr-2 ${isLoading ? 'animate-spin' : ''}`} />
                   {messages.repoPage?.refreshWiki || 'Refresh Wiki'}
                 </button>
+              </div>
+
+              {/* Codemap Explorer button */}
+              <div className="mb-5">
+                <Link
+                  href={`/${effectiveRepoInfo.owner}/${effectiveRepoInfo.repo}/codemap?type=${effectiveRepoInfo.type}${currentToken ? `&token=${currentToken}` : ''}${providerParam ? `&provider=${providerParam}` : ''}${modelParam ? `&model=${modelParam}` : ''}${language ? `&language=${language}` : ''}`}
+                  className="flex items-center w-full text-xs px-3 py-2 bg-[var(--accent-primary)]/10 text-[var(--accent-primary)] rounded-md hover:bg-[var(--accent-primary)]/20 border border-[var(--accent-primary)]/30 transition-colors"
+                >
+                  <FaProjectDiagram className="mr-2" />
+                  {messages.repoPage?.exploreCodemap || 'Explore Codemap'}
+                </Link>
               </div>
 
               {/* Export buttons */}

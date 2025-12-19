@@ -399,6 +399,13 @@ app.add_api_route("/chat/completions/stream", chat_completions_stream, methods=[
 # Add the WebSocket endpoint
 app.add_websocket_route("/ws/chat", handle_websocket_chat)
 
+# Import and register codemap API routes
+from api.codemap_api import router as codemap_router
+from api.websocket_codemap import handle_websocket_codemap
+
+app.include_router(codemap_router)
+app.add_websocket_route("/ws/codemap", handle_websocket_codemap)
+
 # --- Wiki Cache Helper Functions ---
 
 WIKI_CACHE_DIR = os.path.join(get_adalflow_default_root_path(), "wikicache")

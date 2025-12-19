@@ -77,6 +77,19 @@ class GoogleEmbedderClient(ModelClient):
             )
         self._client = genai.Client(api_key=api_key)
 
+    def __getstate__(self):
+        """Return state for pickling, excluding non-serializable client."""
+        state = self.__dict__.copy()
+        # Remove the client as it contains thread locks that can't be pickled
+        state['_client'] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from pickle and reinitialize client."""
+        self.__dict__.update(state)
+        # Reinitialize the client after unpickling
+        self._initialize_client()
+
     def parse_embedding_response(self, response) -> EmbedderOutput:
         """Parse Google AI embedding response to EmbedderOutput format.
 
